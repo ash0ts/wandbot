@@ -20,20 +20,26 @@ This module is meant to be run as a script and not imported as a module. When ru
 ZendeskWandBotResponseSystem object and runs it in an event loop.
 
 """
-
+import os
 import asyncio
 from typing import List
 
 from zenpy import Zenpy
 from zenpy.lib.api_objects import Comment, Ticket
 
-from wandbot.api.client import AsyncAPIClient
 from wandbot.apps.zendesk.config import zendesk_app_config
-from wandbot.apps.zendesk.extract_by_type import *
 from wandbot.utils import get_logger
+from wandbot.apps.zendesk.extract_by_type import *
+from wandbot.apps.zendesk.testing_utils import DummyAPIClient, DummyResponse
 
 logger = get_logger(__name__)
 config = zendesk_app_config()
+
+if config.ZENDESK_TEST_API_MODE:
+    api_client = DummyAPIClient()
+else:
+    from wandbot.api.client import AsyncAPIClient
+    api_client = AsyncAPIClient(url=config.WANDBOT_API_URL)
 
 
 def extract_question(ticket: Ticket) -> str:
@@ -56,6 +62,8 @@ def extract_question(ticket: Ticket) -> str:
         return offline_msg_ext(description)
     elif "add_cc_note" in ticket.tags:
         return email_msg_ext(description)
+    elif "bottest" in ticket.tags:
+        return description
 
     return question
 
@@ -78,7 +86,6 @@ def format_response(response: str) -> str:
     final_response = config.DISCBOTINTRO + response_str
     return f"{final_response}\n\n-WandBot 🤖"
 
-
 class ZendeskWandBotResponseSystem:
     """Handles the interaction with the Zendesk system.
 
@@ -90,7 +97,6 @@ class ZendeskWandBotResponseSystem:
         api_client (AsyncAPIClient): The client for interacting with the WandBot API.
         semaphore (Semaphore): Use semaphore to control how many api calls to wandbot we make
     """
-
     def __init__(self) -> None:
         """Initializes the ZendeskWandBotResponseSystem with the necessary clients.
 
@@ -103,7 +109,10 @@ class ZendeskWandBotResponseSystem:
             "subdomain": config.ZENDESK_SUBDOMAIN,
         }
         self.zenpy_client = Zenpy(**self.user_creds)
-        self.api_client = AsyncAPIClient(url=config.WANDBOT_API_URL)
+        if config.ZENDESK_TEST_API_MODE:
+            self.api_client = DummyAPIClient()
+        else:
+            self.api_client = AsyncAPIClient(url=config.WANDBOT_API_URL)
 
         self.semaphore = asyncio.Semaphore(config.MAX_WANDBOT_REQUESTS)
         self.request_interval = config.REQUEST_INTERVAL
@@ -118,14 +127,14 @@ class ZendeskWandBotResponseSystem:
         Returns:
             list: A list of filtered tickets that are new and have not been answered by the bot.
         """
-        exclude_tags = ["answered_by_bot", "zopim_chat", "picked_up_by_bot"]
         new_tickets = self.zenpy_client.search(
             type="ticket",
             status="new",
-            tags=["forum", "zopim_offline_message"],
-            minus=[f"tags:{tag}" for tag in exclude_tags],
+            tags=config.include_tags,
+            minus=[f"tags:{tag}" for tag in config.exclude_tags],
         )
         return new_tickets
+
 
     async def generate_response(self, question: str) -> str:
         """Generates a response to a given question.
@@ -142,6 +151,8 @@ class ZendeskWandBotResponseSystem:
         """
 
         try:
+            if config.ZENDESK_TEST_TICKET_MODE:
+                logger.info(f"Querying wandbot with question: {question}")
             response = await self.api_client.query(
                 question=question, chat_history=[], language=config.bot_language
             )
@@ -214,14 +225,30 @@ class ZendeskWandBotResponseSystem:
         # after set_limit number of tickets, have a timeout
         set_limit = config.MAX_WANDBOT_REQUESTS
         logger.info(f"WandBot + zendesk is running")
+
         sem = asyncio.Semaphore(set_limit)
+
+        if config.ZENDESK_TEST_TICKET_MODE:
+            self.zenpy_client = Zenpy(**self.user_creds)
+            logger.info("Creating test ticket!")
+            # Create a fake ticket for testing
+            fake_ticket = Ticket(
+                subject="Test Ticket",
+                description=config.ZENDESK_TEST_TICKET_DESCRIPTION,
+                status="new",
+                tags=["bottest"],
+                group_id=config.ZDGROUPID
+            )
+            
+            # Write the fake ticket to Zendesk
+            self.zenpy_client.tickets.create(fake_ticket)
 
         while True:
             await asyncio.sleep(config.INTERVAL_TO_FETCH_TICKETS)
 
             # restart the zenpy client because it times out after 3 minutes
             self.zenpy_client = Zenpy(**self.user_creds)
-
+                
             # Fetch new tickets
             new_tickets = list(self.fetch_new_tickets())
             logger.info(f"New unanswered Zendesk tickets: {new_tickets}")
@@ -240,6 +267,7 @@ class ZendeskWandBotResponseSystem:
 
                 # Timeout after a certain amount of tickets, 5 in this case
                 if i + set_limit < len(new_tickets):
+                    # Zendesk updates status very slowly so we need to sleep to accomodate for updates
                     await asyncio.sleep(config.REQUEST_INTERVAL)
 
             if len(new_tickets) > 0:
