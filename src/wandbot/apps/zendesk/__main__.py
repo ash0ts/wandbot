@@ -30,16 +30,9 @@ from zenpy.lib.api_objects import Comment, Ticket
 from wandbot.apps.zendesk.config import zendesk_app_config
 from wandbot.utils import get_logger
 from wandbot.apps.zendesk.extract_by_type import *
-from wandbot.apps.zendesk.testing_utils import DummyAPIClient, DummyResponse
 
 logger = get_logger(__name__)
 config = zendesk_app_config()
-
-if config.ZENDESK_TEST_API_MODE:
-    api_client = DummyAPIClient()
-else:
-    from wandbot.api.client import AsyncAPIClient
-    api_client = AsyncAPIClient(url=config.WANDBOT_API_URL)
 
 
 def extract_question(ticket: Ticket) -> str:
@@ -110,8 +103,10 @@ class ZendeskWandBotResponseSystem:
         }
         self.zenpy_client = Zenpy(**self.user_creds)
         if config.ZENDESK_TEST_API_MODE:
+            from wandbot.apps.zendesk.testing_utils import DummyAPIClient, DummyResponse
             self.api_client = DummyAPIClient()
         else:
+            from wandbot.api.client import AsyncAPIClient
             self.api_client = AsyncAPIClient(url=config.WANDBOT_API_URL)
 
         self.semaphore = asyncio.Semaphore(config.MAX_WANDBOT_REQUESTS)
@@ -181,8 +176,14 @@ class ZendeskWandBotResponseSystem:
             None
         """
 
+        public = False
+        ticket_tags = set(ticket.tags)
+        if ticket_tags.intersection(config.public_tags) and ticket.priority == "low":
+            public = True
+        if ticket_tags.intersection(config.private_tags) or ticket.priority in ["urgent", "high"]:
+            public = False
         try:
-            ticket.comment = Comment(body=response, public=False)
+            ticket.comment = Comment(body=response, public=public)
             ticket.status = "open"
             ticket.tags.append("answered_by_bot")
             self.zenpy_client.tickets.update(ticket)
@@ -237,15 +238,15 @@ class ZendeskWandBotResponseSystem:
                 description=config.ZENDESK_TEST_TICKET_DESCRIPTION,
                 status="new",
                 tags=["bottest"],
-                group_id=config.ZDGROUPID
+                group_id=config.ZDGROUPID,
+                priority="low"
             )
             
             # Write the fake ticket to Zendesk
             self.zenpy_client.tickets.create(fake_ticket)
+            await asyncio.sleep(120)
 
         while True:
-            await asyncio.sleep(config.INTERVAL_TO_FETCH_TICKETS)
-
             # restart the zenpy client because it times out after 3 minutes
             self.zenpy_client = Zenpy(**self.user_creds)
                 
@@ -273,6 +274,7 @@ class ZendeskWandBotResponseSystem:
             if len(new_tickets) > 0:
                 logger.info(f"Done processing tickets: {len(new_tickets)}")
 
+            await asyncio.sleep(config.INTERVAL_TO_FETCH_TICKETS)
 
 if __name__ == "__main__":
     zd = ZendeskWandBotResponseSystem()
